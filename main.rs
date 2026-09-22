@@ -60,6 +60,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     insecure: bool,
 
+    /// Пауза между последовательными пробниками ВНУТРИ одного домена, мс.
+    /// По умолчанию 0. Если подозреваешь бот-детект/rate-limit на WAF —
+    /// попробуй 300-500, это сделает трафик менее похожим на сканер
+    /// (за счёт скорости, конечно).
+    #[arg(long, default_value_t = 0)]
+    probe_delay_ms: u64,
+
     /// User-Agent (важно оставить опознаваемым для WAF/логов)
     #[arg(long, default_value = "Mozilla/5.0 (compatible; wpscan-rs/0.3; +internal-security-audit)")]
     user_agent: String,
@@ -146,6 +153,13 @@ async fn probe(client: &Client, url: &str, last_error: &mut String, reached: &mu
 struct Clients {
     follow: Client,
     no_redirect: Client,
+    probe_delay_ms: u64,
+}
+
+async fn maybe_delay(clients: &Clients) {
+    if clients.probe_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(clients.probe_delay_ms)).await;
+    }
 }
 
 struct WpDetection {
@@ -188,6 +202,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 2) /wp-json/ — REST API, обычный путь.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(client, &format!("{}/wp-json/", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
@@ -201,6 +216,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     // 2b) Альтернативный REST route — работает даже если pretty permalinks
     //     выключены и /wp-json/ отдаёт 404. Это как раз то, что часто
     //     ловит feroxbuster, а прямой /wp-json/ — нет.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(client, &format!("{}/?rest_route=/", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
@@ -213,6 +229,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
 
     // 3) /xmlrpc.php — классическая сигнатура, почти никогда не выключена.
     //    GET на него отдаёт характерный текст даже без авторизации.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(client, &format!("{}/xmlrpc.php", base), &mut last_error, &mut any_request_succeeded).await {
         if let Ok(body) = resp.text().await {
             if body.contains("XML-RPC server accepts POST requests only")
@@ -224,6 +241,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 4) /wp-login.php — прямой контент или характерный редирект.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(client, &format!("{}/wp-login.php", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status().is_success() || resp.status() == StatusCode::FORBIDDEN {
             if let Ok(body) = resp.text().await {
@@ -240,6 +258,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     //    Важно: используем клиент БЕЗ автоследования редиректам, иначе
     //    reqwest сам уйдёт на wp-login.php и мы получим 200 с другим URL,
     //    а не Location-заголовок, который нам тут и нужен.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(&clients.no_redirect, &format!("{}/wp-admin/", base), &mut last_error, &mut any_request_succeeded).await {
         let location = resp
             .headers()
@@ -253,6 +272,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 6) /feed/ — RSS почти всегда содержит generator тег с wordpress.org.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(client, &format!("{}/feed/", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
@@ -264,6 +284,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 7) /readme.html в корне — дефолтный файл ядра, часто забывают удалить.
+    maybe_delay(clients).await;
     if let Some(resp) = probe(client, &format!("{}/readme.html", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
@@ -401,6 +422,12 @@ async fn main() -> anyhow::Result<()> {
         .user_agent(args.user_agent.clone())
         .redirect(reqwest::redirect::Policy::limited(5))
         .danger_accept_invalid_certs(args.insecure)
+        .default_headers({
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(reqwest::header::ACCEPT, "text/html,application/json,*/*;q=0.8".parse().unwrap());
+            h.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
+            h
+        })
         .build()?;
 
     let no_redirect_client = Client::builder()
@@ -408,11 +435,18 @@ async fn main() -> anyhow::Result<()> {
         .user_agent(args.user_agent.clone())
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(args.insecure)
+        .default_headers({
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(reqwest::header::ACCEPT, "text/html,application/json,*/*;q=0.8".parse().unwrap());
+            h.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
+            h
+        })
         .build()?;
 
     let clients = std::sync::Arc::new(Clients {
         follow: follow_client,
         no_redirect: no_redirect_client,
+        probe_delay_ms: args.probe_delay_ms,
     });
 
     let results: Vec<Row> = stream::iter(domains.into_iter())
