@@ -336,7 +336,10 @@ async fn check_plugin(client: &Client, base: &str) -> PluginCheck {
 
 async fn scan_domain(clients: &Clients, raw_domain: &str) -> Row {
     let candidates = scheme_candidates(raw_domain);
-    let mut last_unreachable_method = String::new();
+    // Раньше хранился только текст последней ошибки, из-за чего при провале
+    // и https, и http в сообщении оставалась только вторая (http), а что
+    // случилось с https — терялось. Теперь копим ошибку по каждой схеме отдельно.
+    let mut scheme_errors: Vec<String> = Vec::new();
 
     for base in candidates {
         let wp = detect_wordpress(clients, &base).await;
@@ -355,8 +358,6 @@ async fn scan_domain(clients: &Clients, raw_domain: &str) -> Row {
         }
 
         if wp.reachable {
-            // Домен ответил, но признаков WP нет — дальше пробовать другую схему
-            // для того же хоста почти бессмысленно, фиксируем результат сразу.
             return Row {
                 domain: raw_domain.to_string(),
                 scheme_used: base,
@@ -368,15 +369,14 @@ async fn scan_domain(clients: &Clients, raw_domain: &str) -> Row {
             };
         }
 
-        // Не достучались по этой схеме — пробуем следующую (https -> http).
-        last_unreachable_method = wp.method;
+        scheme_errors.push(format!("{} -> {}", base, wp.method));
     }
 
     Row {
         domain: raw_domain.to_string(),
         scheme_used: "".into(),
         is_wordpress: false,
-        wp_detection: format!("UNREACHABLE: {}", last_unreachable_method),
+        wp_detection: format!("UNREACHABLE: {}", scheme_errors.join(" | ")),
         plugin_status: "skipped_unreachable".into(),
         plugin_version: "".into(),
         cve_2026_9858_vulnerable: false,
