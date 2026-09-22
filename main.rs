@@ -40,8 +40,12 @@ struct Args {
     #[arg(short, long, default_value = "results.csv")]
     output: String,
 
-    /// Число одновременных запросов
-    #[arg(short, long, default_value_t = 50)]
+    /// Число одновременных запросов. Каждый домен внутри делает до 7-8
+    /// последовательных HTTP-запросов (сигналы WP), так что при -c 50
+    /// одновременно может быть открыто 300+ соединений — на части сетей/прокси
+    /// это приводит к connection reset и ложным "все запросы упали".
+    /// Если ловишь массовые unreachable — снижай это значение, не таймаут.
+    #[arg(short, long, default_value_t = 25)]
     concurrency: usize,
 
     /// Таймаут одного запроса, сек
@@ -95,8 +99,32 @@ fn version_lte(ver: &str, max_vulnerable: &str) -> Option<bool> {
     Some(true)
 }
 
-async fn get(client: &Client, url: &str) -> Option<Response> {
-    client.get(url).send().await.ok()
+async fn get(client: &Client, url: &str) -> Result<Response, String> {
+    client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!("timeout: {}", e)
+        } else if e.is_connect() {
+            format!("connect error: {}", e)
+        } else {
+            format!("{}", e)
+        }
+    })
+}
+
+/// Обёртка вокруг get(), которая параллельно пишет реальную причину ошибки
+/// в last_error и взводит reached=true при любом успешном ответе (даже 403/404 —
+/// это всё равно значит "сервер ответил", в отличие от timeout/connect error).
+async fn probe(client: &Client, url: &str, last_error: &mut String, reached: &mut bool) -> Option<Response> {
+    match get(client, url).await {
+        Ok(resp) => {
+            *reached = true;
+            Some(resp)
+        }
+        Err(e) => {
+            *last_error = format!("{} ({})", e, url);
+            None
+        }
+    }
 }
 
 /// Клиенты для двух режимов: обычный (следует редиректам — нужен почти
@@ -121,10 +149,10 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     let client = &clients.follow;
     let generator_re = Regex::new(r#"(?i)<meta\s+name=["']generator["']\s+content=["']WordPress"#).unwrap();
     let mut any_request_succeeded = false;
+    let mut last_error = String::new();
 
     // 1) Главная страница: meta generator, wp-content/wp-includes в HTML, Link-заголовок на wp-json.
-    if let Some(resp) = get(client, base).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, base, &mut last_error, &mut any_request_succeeded).await {
         let link_hit = resp
             .headers()
             .get("link")
@@ -148,8 +176,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 2) /wp-json/ — REST API, обычный путь.
-    if let Some(resp) = get(client, &format!("{}/wp-json/", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, &format!("{}/wp-json/", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
                 if body.contains("wp/v2") || body.contains("\"namespaces\"") {
@@ -162,8 +189,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     // 2b) Альтернативный REST route — работает даже если pretty permalinks
     //     выключены и /wp-json/ отдаёт 404. Это как раз то, что часто
     //     ловит feroxbuster, а прямой /wp-json/ — нет.
-    if let Some(resp) = get(client, &format!("{}/?rest_route=/", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, &format!("{}/?rest_route=/", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
                 if body.contains("wp/v2") || body.contains("\"namespaces\"") {
@@ -175,8 +201,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
 
     // 3) /xmlrpc.php — классическая сигнатура, почти никогда не выключена.
     //    GET на него отдаёт характерный текст даже без авторизации.
-    if let Some(resp) = get(client, &format!("{}/xmlrpc.php", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, &format!("{}/xmlrpc.php", base), &mut last_error, &mut any_request_succeeded).await {
         if let Ok(body) = resp.text().await {
             if body.contains("XML-RPC server accepts POST requests only")
                 || body.contains("XML-RPC")
@@ -187,8 +212,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 4) /wp-login.php — прямой контент или характерный редирект.
-    if let Some(resp) = get(client, &format!("{}/wp-login.php", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, &format!("{}/wp-login.php", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status().is_success() || resp.status() == StatusCode::FORBIDDEN {
             if let Ok(body) = resp.text().await {
                 let lower = body.to_lowercase();
@@ -204,8 +228,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     //    Важно: используем клиент БЕЗ автоследования редиректам, иначе
     //    reqwest сам уйдёт на wp-login.php и мы получим 200 с другим URL,
     //    а не Location-заголовок, который нам тут и нужен.
-    if let Some(resp) = get(&clients.no_redirect, &format!("{}/wp-admin/", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(&clients.no_redirect, &format!("{}/wp-admin/", base), &mut last_error, &mut any_request_succeeded).await {
         let location = resp
             .headers()
             .get("location")
@@ -218,8 +241,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 6) /feed/ — RSS почти всегда содержит generator тег с wordpress.org.
-    if let Some(resp) = get(client, &format!("{}/feed/", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, &format!("{}/feed/", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
                 if body.to_lowercase().contains("wordpress.org") {
@@ -230,8 +252,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     // 7) /readme.html в корне — дефолтный файл ядра, часто забывают удалить.
-    if let Some(resp) = get(client, &format!("{}/readme.html", base)).await {
-        any_request_succeeded = true;
+    if let Some(resp) = probe(client, &format!("{}/readme.html", base), &mut last_error, &mut any_request_succeeded).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
                 if body.to_lowercase().contains("wordpress") {
@@ -242,7 +263,7 @@ async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
     }
 
     if !any_request_succeeded {
-        return WpDetection { is_wp: false, reachable: false, method: "все запросы упали (сеть/TLS/таймаут)".into() };
+        return WpDetection { is_wp: false, reachable: false, method: format!("все запросы упали: {}", last_error) };
     }
 
     WpDetection { is_wp: false, reachable: true, method: "ни один из сигналов не сработал".into() }
@@ -258,7 +279,7 @@ async fn check_plugin(client: &Client, base: &str) -> PluginCheck {
     let readme_re = Regex::new(r"(?i)stable tag:\s*([0-9]+(?:\.[0-9]+){0,2})").unwrap();
 
     let readme_url = format!("{}/wp-content/plugins/{}/readme.txt", base, PLUGIN_SLUG);
-    if let Some(resp) = get(client, &readme_url).await {
+    if let Ok(resp) = get(client, &readme_url).await {
         if resp.status() == StatusCode::OK {
             if let Ok(body) = resp.text().await {
                 if body.to_lowercase().contains("partial shipment") || readme_re.is_match(&body) {
@@ -285,7 +306,7 @@ async fn check_plugin(client: &Client, base: &str) -> PluginCheck {
     ];
 
     for page in candidate_pages.iter() {
-        if let Some(resp) = get(client, page).await {
+        if let Ok(resp) = get(client, page).await {
             if let Ok(body) = resp.text().await {
                 if body.contains(PLUGIN_SLUG) {
                     return PluginCheck {
