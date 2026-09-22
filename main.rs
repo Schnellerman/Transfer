@@ -52,6 +52,14 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     timeout: u64,
 
+    /// ДИАГНОСТИКА: отключить проверку TLS-сертификата (как curl -k).
+    /// Если с этим флагом домен вдруг находится — значит проблема
+    /// была именно в валидации цепочки сертификата, а не в сети.
+    /// Для постоянной работы не рекомендуется — оставь выключенным
+    /// после того как разберёшься в причине.
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
+
     /// User-Agent (важно оставить опознаваемым для WAF/логов)
     #[arg(long, default_value = "Mozilla/5.0 (compatible; wpscan-rs/0.3; +internal-security-audit)")]
     user_agent: String,
@@ -68,15 +76,19 @@ struct Row {
     cve_2026_9858_vulnerable: bool,
 }
 
-/// Возвращает кандидатов схемы: если домен без схемы — пробуем https, потом http.
-/// Если схема уже указана явно пользователем — используем только её.
+/// Возвращает кандидатов схемы. Раньше: если в строке уже была схема
+/// (http:// или https://), использовалась ТОЛЬКО она без fallback — из-за
+/// этого домены с "http://" в списке, но без открытого порта 80
+/// (частый случай — весь трафик только через 443/CDN), гарантированно
+/// получали connect error и никогда не доходили до https.
+/// Теперь схема из списка игнорируется: всегда пробуем https первым,
+/// http — только если https реально не смог законнектиться.
 fn scheme_candidates(raw: &str) -> Vec<String> {
     let raw = raw.trim().trim_end_matches('/');
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        vec![raw.to_string()]
-    } else {
-        vec![format!("https://{}", raw), format!("http://{}", raw)]
-    }
+    let host = raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    vec![format!("https://{}", host), format!("http://{}", host)]
 }
 
 fn version_lte(ver: &str, max_vulnerable: &str) -> Option<bool> {
@@ -388,12 +400,14 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(args.timeout))
         .user_agent(args.user_agent.clone())
         .redirect(reqwest::redirect::Policy::limited(5))
+        .danger_accept_invalid_certs(args.insecure)
         .build()?;
 
     let no_redirect_client = Client::builder()
         .timeout(Duration::from_secs(args.timeout))
         .user_agent(args.user_agent.clone())
         .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(args.insecure)
         .build()?;
 
     let clients = std::sync::Arc::new(Clients {
