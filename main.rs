@@ -406,6 +406,25 @@ async fn scan_domain(clients: &Clients, raw_domain: &str) -> Row {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Включается через переменную окружения RUST_LOG, ничего не печатает по умолчанию.
+    // Пример для диагностики конкретного домена:
+    //   RUST_LOG=reqwest=trace,hyper=trace,hyper_util=trace ./wpscan-rs -i one_domain.txt ...
+    // Покажет реальный DNS-резолв, попытки коннекта по каждому адресу,
+    // использование системного прокси (если он есть) и TLS-хендшейк —
+    // то есть именно то место, где реально рвётся, а не догадки по аналогии с curl.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    // Явная проверка: если тут пусто, а curl у тебя в другом терминале
+    // ходит через прокси (например, настроенный VPN-клиентом), это
+    // многое объяснит — env-переменные не наследуются между сессиями/оболочками.
+    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        if let Ok(val) = std::env::var(var) {
+            println!("[proxy env] {} = {}", var, val);
+        }
+    }
+
     let args = Args::parse();
 
     let content = fs::read_to_string(&args.input)?;
