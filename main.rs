@@ -1,502 +1,235 @@
-// wpscan-rs
-//
-// Внешний (HTTP-only) скан большого списка доменов в 2 фазы:
-//
-//   Фаза 1: детект WordPress по набору независимых сигнатур
-//           (обычный HTML/meta, /wp-json/, alt REST route, /wp-login.php,
-//           /wp-admin/ редирект, /xmlrpc.php, /readme.html, /feed/).
-//           Сетевая ошибка (TLS/DNS/timeout) помечается отдельно
-//           от "признаков WP не нашёл" — это разные вещи, и их
-//           нельзя схлопывать в один статус, иначе занижаешь охват.
-//
-//   Фаза 2: только для доменов, где WP подтверждён — проверка плагина
-//           "Partial Shipment for WooCommerce" (slug: wc-partial-shipment)
-//           и его версии на CVE-2026-9858 (Missing Authorization, <= 3.4).
-//
-// Использование:
-//   wpscan-rs -i list.txt -o results.csv -c 50 --timeout 8
-//
-// list.txt: один домен/URL на строку, https:// не обязателен.
+//! Passive WordPress version checker for CVE-2026-93485 ("Comment2Shell").
+//!
+//! This tool ONLY reads version information that a WordPress site exposes to any
+//! visitor (meta generator tag, /feed/ generator, /wp-includes/version.php,
+//! /wp-json/). It does NOT send comments, payloads, or exploit anything.
+//! Run it only against hosts you are authorized to assess.
+//!
+//! Vulnerability: stored XSS -> RCE in WordPress core, versions 4.7 .. 7.1.0.
+//! Fixed in 7.1.1 (with security backports on each branch, e.g. 7.0.5, 6.9.8,
+//! down to 4.7.36). Because of backports, "version < 7.1.1" is NOT a valid
+//! verdict on its own — we compare against the fixed version of the same branch.
+//!
+//! Usage:
+//!   cargo run --release -- domains.txt
+//!   (one domain per line; blank lines and lines starting with # are ignored)
+//!
+//! Output: CSV to stdout -> domain,wp_detected,version,source,status
 
-use clap::Parser;
 use futures::stream::{self, StreamExt};
+use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::{Client, Response, StatusCode};
-use serde::Serialize;
-use std::fs;
+use std::collections::HashMap;
 use std::time::Duration;
 
-const PLUGIN_SLUG: &str = "wc-partial-shipment";
-const VULNERABLE_MAX_VERSION: &str = "3.4";
+const CONCURRENCY: usize = 15;
+const TIMEOUT_SECS: u64 = 12;
+const UA: &str = "wp-version-check/0.1 (authorized security assessment)";
 
-#[derive(Parser, Debug)]
-#[command(name = "wpscan-rs", about = "External WordPress + CVE-2026-9858 perimeter scanner")]
-struct Args {
-    /// Файл со списком доменов, по одному на строку
-    #[arg(short, long)]
-    input: String,
+// --- Fixed version per WordPress branch (major.minor -> fixed patch) ---------
+// Main branches confirmed from the 7.1.1 advisory. Older branches down to 4.7
+// also received backports (…, 4.7.36). Fill these in from the WordPress release
+// notes for a fully precise verdict on legacy installs; until then, an affected
+// legacy branch is reported as VERIFY_BACKPORT rather than guessed.
+static FIXED: Lazy<HashMap<(u32, u32), (u32, u32, u32)>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    m.insert((7, 1), (7, 1, 1));
+    m.insert((7, 0), (7, 0, 5));
+    m.insert((6, 9), (6, 9, 8));
+    // Example of how to extend with backports once you pull the full list:
+    // m.insert((6, 8), (6, 8, X));
+    // ...
+    // m.insert((4, 7), (4, 7, 36));
+    m
+});
 
-    /// Куда сохранить CSV с результатами
-    #[arg(short, long, default_value = "results.csv")]
-    output: String,
+// First affected branch. Anything below 4.7 predates the vulnerable code path.
+const FIRST_AFFECTED: (u32, u32, u32) = (4, 7, 0);
 
-    /// Число одновременных запросов. Каждый домен внутри делает до 7-8
-    /// последовательных HTTP-запросов (сигналы WP), так что при -c 50
-    /// одновременно может быть открыто 300+ соединений — на части сетей/прокси
-    /// это приводит к connection reset и ложным "все запросы упали".
-    /// Если ловишь массовые unreachable — снижай это значение, не таймаут.
-    #[arg(short, long, default_value_t = 25)]
-    concurrency: usize,
+type Ver = (u32, u32, u32);
 
-    /// Таймаут одного запроса, сек
-    #[arg(long, default_value_t = 8)]
-    timeout: u64,
-
-    /// ДИАГНОСТИКА: отключить проверку TLS-сертификата (как curl -k).
-    /// Если с этим флагом домен вдруг находится — значит проблема
-    /// была именно в валидации цепочки сертификата, а не в сети.
-    /// Для постоянной работы не рекомендуется — оставь выключенным
-    /// после того как разберёшься в причине.
-    #[arg(long, default_value_t = false)]
-    insecure: bool,
-
-    /// Пауза между последовательными пробниками ВНУТРИ одного домена, мс.
-    /// По умолчанию 0. Если подозреваешь бот-детект/rate-limit на WAF —
-    /// попробуй 300-500, это сделает трафик менее похожим на сканер
-    /// (за счёт скорости, конечно).
-    #[arg(long, default_value_t = 0)]
-    probe_delay_ms: u64,
-
-    /// User-Agent (важно оставить опознаваемым для WAF/логов)
-    #[arg(long, default_value = "Mozilla/5.0 (compatible; wpscan-rs/0.3; +internal-security-audit)")]
-    user_agent: String,
+fn parse_ver(s: &str) -> Option<Ver> {
+    let mut it = s.trim().split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next().unwrap_or("0").parse().ok()?;
+    let patch = it.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
 }
 
-#[derive(Debug, Serialize)]
-struct Row {
+fn classify(v: Ver) -> &'static str {
+    if v < FIRST_AFFECTED {
+        return "NOT_AFFECTED";
+    }
+    match FIXED.get(&(v.0, v.1)) {
+        Some(&fixed) => {
+            if v < fixed {
+                "VULNERABLE"
+            } else {
+                "PATCHED"
+            }
+        }
+        // Branch is in the affected range but we don't have its fixed patch
+        // version hardcoded — don't guess.
+        None => "VERIFY_BACKPORT",
+    }
+}
+
+// --- Version extractors ------------------------------------------------------
+static RE_VERSION_PHP: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"\$wp_version\s*=\s*'([0-9]+(?:\.[0-9]+){1,2})'"#).unwrap());
+static RE_GENERATOR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"WordPress\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)"#).unwrap());
+static RE_FEED_VER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"wordpress\.org/\?v=([0-9]+\.[0-9]+(?:\.[0-9]+)?)"#).unwrap());
+
+struct Record {
     domain: String,
-    scheme_used: String,
-    is_wordpress: bool,
-    wp_detection: String,
-    plugin_status: String,
-    plugin_version: String,
-    cve_2026_9858_vulnerable: bool,
-}
-
-/// Возвращает кандидатов схемы. Раньше: если в строке уже была схема
-/// (http:// или https://), использовалась ТОЛЬКО она без fallback — из-за
-/// этого домены с "http://" в списке, но без открытого порта 80
-/// (частый случай — весь трафик только через 443/CDN), гарантированно
-/// получали connect error и никогда не доходили до https.
-/// Теперь схема из списка игнорируется: всегда пробуем https первым,
-/// http — только если https реально не смог законнектиться.
-fn scheme_candidates(raw: &str) -> Vec<String> {
-    let raw = raw.trim().trim_end_matches('/');
-    let host = raw
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    vec![format!("https://{}", host), format!("http://{}", host)]
-}
-
-fn version_lte(ver: &str, max_vulnerable: &str) -> Option<bool> {
-    let parse = |s: &str| -> Option<Vec<u32>> {
-        s.trim().split('.').map(|p| p.parse::<u32>().ok()).collect()
-    };
-    let v = parse(ver)?;
-    let m = parse(max_vulnerable)?;
-    let len = v.len().max(m.len());
-    for i in 0..len {
-        let a = *v.get(i).unwrap_or(&0);
-        let b = *m.get(i).unwrap_or(&0);
-        if a < b {
-            return Some(true);
-        }
-        if a > b {
-            return Some(false);
-        }
-    }
-    Some(true)
-}
-
-async fn get(client: &Client, url: &str) -> Result<Response, String> {
-    client.get(url).send().await.map_err(|e| {
-        if e.is_timeout() {
-            format!("timeout: {}", e)
-        } else if e.is_connect() {
-            format!("connect error: {}", e)
-        } else {
-            format!("{}", e)
-        }
-    })
-}
-
-/// Обёртка вокруг get(), которая параллельно пишет реальную причину ошибки
-/// в last_error и взводит reached=true при любом успешном ответе (даже 403/404 —
-/// это всё равно значит "сервер ответил", в отличие от timeout/connect error).
-async fn probe(client: &Client, url: &str, last_error: &mut String, reached: &mut bool) -> Option<Response> {
-    match get(client, url).await {
-        Ok(resp) => {
-            *reached = true;
-            Some(resp)
-        }
-        Err(e) => {
-            *last_error = format!("{} ({})", e, url);
-            None
-        }
-    }
-}
-
-/// Клиенты для двух режимов: обычный (следует редиректам — нужен почти
-/// везде, т.к. сайты редиректят http->https и domain->www) и no-redirect
-/// (нужен только для одной проверки: смотрим сам Location у /wp-admin/,
-/// который почти всегда указывает на wp-login.php).
-struct Clients {
-    follow: Client,
-    no_redirect: Client,
-    probe_delay_ms: u64,
-}
-
-async fn maybe_delay(clients: &Clients) {
-    if clients.probe_delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(clients.probe_delay_ms)).await;
-    }
-}
-
-struct WpDetection {
-    is_wp: bool,
-    // true = сигнатуру не нашли ни на одном пути, false = не смогли проверить (сеть)
-    reachable: bool,
-    method: String,
-}
-
-/// Многосигнальный детект. Порядок — от дешёвого/надёжного к более редкому.
-/// Останавливается на первом сработавшем сигнале.
-async fn detect_wordpress(clients: &Clients, base: &str) -> WpDetection {
-    let client = &clients.follow;
-    let generator_re = Regex::new(r#"(?i)<meta\s+name=["']generator["']\s+content=["']WordPress"#).unwrap();
-    let mut any_request_succeeded = false;
-    let mut last_error = String::new();
-
-    // 1) Главная страница: meta generator, wp-content/wp-includes в HTML, Link-заголовок на wp-json.
-    if let Some(resp) = probe(client, base, &mut last_error, &mut any_request_succeeded).await {
-        let link_hit = resp
-            .headers()
-            .get("link")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("wp-json"))
-            .unwrap_or(false);
-
-        if let Ok(body) = resp.text().await {
-            if generator_re.is_match(&body) {
-                return WpDetection { is_wp: true, reachable: true, method: "meta generator".into() };
-            }
-            if body.contains("/wp-content/") || body.contains("/wp-includes/") {
-                return WpDetection { is_wp: true, reachable: true, method: "wp-content/wp-includes в HTML".into() };
-            }
-            if link_hit {
-                return WpDetection { is_wp: true, reachable: true, method: "Link header -> wp-json".into() };
-            }
-        } else if link_hit {
-            return WpDetection { is_wp: true, reachable: true, method: "Link header -> wp-json".into() };
-        }
-    }
-
-    // 2) /wp-json/ — REST API, обычный путь.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(client, &format!("{}/wp-json/", base), &mut last_error, &mut any_request_succeeded).await {
-        if resp.status() == StatusCode::OK {
-            if let Ok(body) = resp.text().await {
-                if body.contains("wp/v2") || body.contains("\"namespaces\"") {
-                    return WpDetection { is_wp: true, reachable: true, method: "/wp-json/".into() };
-                }
-            }
-        }
-    }
-
-    // 2b) Альтернативный REST route — работает даже если pretty permalinks
-    //     выключены и /wp-json/ отдаёт 404. Это как раз то, что часто
-    //     ловит feroxbuster, а прямой /wp-json/ — нет.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(client, &format!("{}/?rest_route=/", base), &mut last_error, &mut any_request_succeeded).await {
-        if resp.status() == StatusCode::OK {
-            if let Ok(body) = resp.text().await {
-                if body.contains("wp/v2") || body.contains("\"namespaces\"") {
-                    return WpDetection { is_wp: true, reachable: true, method: "?rest_route=/ (permalinks off)".into() };
-                }
-            }
-        }
-    }
-
-    // 3) /xmlrpc.php — классическая сигнатура, почти никогда не выключена.
-    //    GET на него отдаёт характерный текст даже без авторизации.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(client, &format!("{}/xmlrpc.php", base), &mut last_error, &mut any_request_succeeded).await {
-        if let Ok(body) = resp.text().await {
-            if body.contains("XML-RPC server accepts POST requests only")
-                || body.contains("XML-RPC")
-            {
-                return WpDetection { is_wp: true, reachable: true, method: "/xmlrpc.php".into() };
-            }
-        }
-    }
-
-    // 4) /wp-login.php — прямой контент или характерный редирект.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(client, &format!("{}/wp-login.php", base), &mut last_error, &mut any_request_succeeded).await {
-        if resp.status().is_success() || resp.status() == StatusCode::FORBIDDEN {
-            if let Ok(body) = resp.text().await {
-                let lower = body.to_lowercase();
-                if lower.contains("wordpress") || lower.contains("wp-submit") {
-                    return WpDetection { is_wp: true, reachable: true, method: "/wp-login.php".into() };
-                }
-            }
-        }
-    }
-
-    // 5) /wp-admin/ без авторизации почти всегда редиректит на wp-login.php
-    //    с ?redirect_to= — сигнал даже если сам wp-login.php вернул что-то нетипичное.
-    //    Важно: используем клиент БЕЗ автоследования редиректам, иначе
-    //    reqwest сам уйдёт на wp-login.php и мы получим 200 с другим URL,
-    //    а не Location-заголовок, который нам тут и нужен.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(&clients.no_redirect, &format!("{}/wp-admin/", base), &mut last_error, &mut any_request_succeeded).await {
-        let location = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if location.contains("wp-login.php") {
-            return WpDetection { is_wp: true, reachable: true, method: "/wp-admin/ -> редирект на wp-login.php".into() };
-        }
-    }
-
-    // 6) /feed/ — RSS почти всегда содержит generator тег с wordpress.org.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(client, &format!("{}/feed/", base), &mut last_error, &mut any_request_succeeded).await {
-        if resp.status() == StatusCode::OK {
-            if let Ok(body) = resp.text().await {
-                if body.to_lowercase().contains("wordpress.org") {
-                    return WpDetection { is_wp: true, reachable: true, method: "/feed/ generator".into() };
-                }
-            }
-        }
-    }
-
-    // 7) /readme.html в корне — дефолтный файл ядра, часто забывают удалить.
-    maybe_delay(clients).await;
-    if let Some(resp) = probe(client, &format!("{}/readme.html", base), &mut last_error, &mut any_request_succeeded).await {
-        if resp.status() == StatusCode::OK {
-            if let Ok(body) = resp.text().await {
-                if body.to_lowercase().contains("wordpress") {
-                    return WpDetection { is_wp: true, reachable: true, method: "/readme.html".into() };
-                }
-            }
-        }
-    }
-
-    if !any_request_succeeded {
-        return WpDetection { is_wp: false, reachable: false, method: format!("все запросы упали: {}", last_error) };
-    }
-
-    WpDetection { is_wp: false, reachable: true, method: "ни один из сигналов не сработал".into() }
-}
-
-struct PluginCheck {
+    wp_detected: bool,
+    version: Option<String>,
+    source: &'static str,
     status: String,
-    version: String,
-    vulnerable: bool,
 }
 
-async fn check_plugin(client: &Client, base: &str) -> PluginCheck {
-    let readme_re = Regex::new(r"(?i)stable tag:\s*([0-9]+(?:\.[0-9]+){0,2})").unwrap();
+async fn fetch(client: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // cap body size to avoid pulling huge pages
+    resp.text().await.ok().map(|b| b.chars().take(500_000).collect())
+}
 
-    let readme_url = format!("{}/wp-content/plugins/{}/readme.txt", base, PLUGIN_SLUG);
-    if let Ok(resp) = get(client, &readme_url).await {
-        if resp.status() == StatusCode::OK {
-            if let Ok(body) = resp.text().await {
-                if body.to_lowercase().contains("partial shipment") || readme_re.is_match(&body) {
-                    if let Some(cap) = readme_re.captures(&body) {
-                        let ver = cap[1].to_string();
-                        let vulnerable = version_lte(&ver, VULNERABLE_MAX_VERSION).unwrap_or(false);
-                        return PluginCheck { status: "found_readme".into(), version: ver, vulnerable };
-                    }
-                    return PluginCheck {
-                        status: "found_readme_no_version".into(),
-                        version: "unknown".into(),
-                        vulnerable: false,
-                    };
+async fn check(client: reqwest::Client, domain: String) -> Record {
+    // Normalize to a base URL; try https first, http as fallback for reachability.
+    let bases: Vec<String> = if domain.starts_with("http://") || domain.starts_with("https://") {
+        vec![domain.clone()]
+    } else {
+        vec![format!("https://{domain}"), format!("http://{domain}")]
+    };
+
+    let mut wp_detected = false;
+    let mut reachable = false;
+
+    for base in &bases {
+        let base = base.trim_end_matches('/');
+
+        // 1) version.php — most authoritative, usually blocked (403) but worth a shot.
+        if let Some(body) = fetch(&client, &format!("{base}/wp-includes/version.php")).await {
+            reachable = true;
+            if let Some(c) = RE_VERSION_PHP.captures(&body) {
+                let v = c[1].to_string();
+                let status = parse_ver(&v).map(classify).unwrap_or("UNKNOWN_VERSION").to_string();
+                return Record { domain, wp_detected: true, version: Some(v), source: "version.php", status };
+            }
+        }
+
+        // 2) homepage -> <meta name="generator" content="WordPress X.Y">
+        if let Some(body) = fetch(&client, base).await {
+            reachable = true;
+            if body.contains("/wp-content/") || body.contains("/wp-includes/") {
+                wp_detected = true;
+            }
+            for line in body.lines().filter(|l| l.contains("generator")) {
+                if let Some(c) = RE_GENERATOR.captures(line) {
+                    wp_detected = true;
+                    let v = c[1].to_string();
+                    let status = parse_ver(&v).map(classify).unwrap_or("UNKNOWN_VERSION").to_string();
+                    return Record { domain, wp_detected: true, version: Some(v), source: "meta-generator", status };
                 }
             }
         }
-    }
 
-    let candidate_pages = [
-        base.to_string(),
-        format!("{}/my-account/orders/", base),
-        format!("{}/checkout/", base),
-        format!("{}/shop/", base),
-    ];
+        // 3) RSS feed -> <generator>https://wordpress.org/?v=X.Y</generator>
+        if let Some(body) = fetch(&client, &format!("{base}/feed/")).await {
+            reachable = true;
+            if let Some(c) = RE_FEED_VER.captures(&body) {
+                wp_detected = true;
+                let v = c[1].to_string();
+                let status = parse_ver(&v).map(classify).unwrap_or("UNKNOWN_VERSION").to_string();
+                return Record { domain, wp_detected: true, version: Some(v), source: "feed", status };
+            }
+        }
 
-    for page in candidate_pages.iter() {
-        if let Ok(resp) = get(client, page).await {
-            if let Ok(body) = resp.text().await {
-                if body.contains(PLUGIN_SLUG) {
-                    return PluginCheck {
-                        status: "suspected_from_html_no_version".into(),
-                        version: "unknown".into(),
-                        vulnerable: false,
-                    };
+        // 4) /wp-json/ — confirms WordPress even when version is hidden.
+        if !wp_detected {
+            if let Some(body) = fetch(&client, &format!("{base}/wp-json/")).await {
+                reachable = true;
+                if body.contains("\"namespace\"") || body.contains("wp/v2") {
+                    wp_detected = true;
                 }
             }
         }
-    }
 
-    PluginCheck { status: "not_found".into(), version: "".into(), vulnerable: false }
-}
-
-async fn scan_domain(clients: &Clients, raw_domain: &str) -> Row {
-    let candidates = scheme_candidates(raw_domain);
-    // Раньше хранился только текст последней ошибки, из-за чего при провале
-    // и https, и http в сообщении оставалась только вторая (http), а что
-    // случилось с https — терялось. Теперь копим ошибку по каждой схеме отдельно.
-    let mut scheme_errors: Vec<String> = Vec::new();
-
-    for base in candidates {
-        let wp = detect_wordpress(clients, &base).await;
-
-        if wp.is_wp {
-            let plugin = check_plugin(&clients.follow, &base).await;
-            return Row {
-                domain: raw_domain.to_string(),
-                scheme_used: base,
-                is_wordpress: true,
-                wp_detection: wp.method,
-                plugin_status: plugin.status,
-                plugin_version: plugin.version,
-                cve_2026_9858_vulnerable: plugin.vulnerable,
-            };
+        if reachable {
+            break; // got a working scheme, don't retry the other one
         }
-
-        if wp.reachable {
-            return Row {
-                domain: raw_domain.to_string(),
-                scheme_used: base,
-                is_wordpress: false,
-                wp_detection: wp.method,
-                plugin_status: "skipped_not_wp".into(),
-                plugin_version: "".into(),
-                cve_2026_9858_vulnerable: false,
-            };
-        }
-
-        scheme_errors.push(format!("{} -> {}", base, wp.method));
     }
 
-    Row {
-        domain: raw_domain.to_string(),
-        scheme_used: "".into(),
-        is_wordpress: false,
-        wp_detection: format!("UNREACHABLE: {}", scheme_errors.join(" | ")),
-        plugin_status: "skipped_unreachable".into(),
-        plugin_version: "".into(),
-        cve_2026_9858_vulnerable: false,
-    }
+    let status = if !reachable {
+        "UNREACHABLE"
+    } else if wp_detected {
+        "UNKNOWN_VERSION" // WP confirmed but version hidden — can't judge safely
+    } else {
+        "NOT_WORDPRESS"
+    };
+
+    Record { domain, wp_detected, version: None, source: "-", status: status.to_string() }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Включается через переменную окружения RUST_LOG, ничего не печатает по умолчанию.
-    // Пример для диагностики конкретного домена:
-    //   RUST_LOG=reqwest=trace,hyper=trace,hyper_util=trace ./wpscan-rs -i one_domain.txt ...
-    // Покажет реальный DNS-резолв, попытки коннекта по каждому адресу,
-    // использование системного прокси (если он есть) и TLS-хендшейк —
-    // то есть именно то место, где реально рвётся, а не догадки по аналогии с curl.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+async fn main() {
+    let path = std::env::args().nth(1).unwrap_or_else(|| "domains.txt".to_string());
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Could not read '{path}': {e}");
+            std::process::exit(1);
+        }
+    };
 
-    // Явная проверка: если тут пусто, а curl у тебя в другом терминале
-    // ходит через прокси (например, настроенный VPN-клиентом), это
-    // многое объяснит — env-переменные не наследуются между сессиями/оболочками.
-    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
-        if let Ok(val) = std::env::var(var) {
-            println!("[proxy env] {} = {}", var, val);
+    let domains: Vec<String> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect();
+
+    let client = reqwest::Client::builder()
+        .user_agent(UA)
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .danger_accept_invalid_certs(true) // recon: don't skip hosts with bad certs
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .expect("client build");
+
+    println!("domain,wp_detected,version,source,status");
+
+    let results: Vec<Record> = stream::iter(domains.into_iter().map(|d| {
+        let client = client.clone();
+        async move { check(client, d).await }
+    }))
+    .buffer_unordered(CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut vuln = 0usize;
+    for r in &results {
+        println!(
+            "{},{},{},{},{}",
+            r.domain,
+            r.wp_detected,
+            r.version.as_deref().unwrap_or("-"),
+            r.source,
+            r.status
+        );
+        if r.status == "VULNERABLE" {
+            vuln += 1;
         }
     }
 
-    let args = Args::parse();
-
-    let content = fs::read_to_string(&args.input)?;
-    let domains: Vec<String> = content
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-
-    println!("Загружено доменов: {}", domains.len());
-
-    let follow_client = Client::builder()
-        .timeout(Duration::from_secs(args.timeout))
-        .user_agent(args.user_agent.clone())
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .danger_accept_invalid_certs(args.insecure)
-        .default_headers({
-            let mut h = reqwest::header::HeaderMap::new();
-            h.insert(reqwest::header::ACCEPT, "text/html,application/json,*/*;q=0.8".parse().unwrap());
-            h.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
-            h
-        })
-        .build()?;
-
-    let no_redirect_client = Client::builder()
-        .timeout(Duration::from_secs(args.timeout))
-        .user_agent(args.user_agent.clone())
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(args.insecure)
-        .default_headers({
-            let mut h = reqwest::header::HeaderMap::new();
-            h.insert(reqwest::header::ACCEPT, "text/html,application/json,*/*;q=0.8".parse().unwrap());
-            h.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
-            h
-        })
-        .build()?;
-
-    let clients = std::sync::Arc::new(Clients {
-        follow: follow_client,
-        no_redirect: no_redirect_client,
-        probe_delay_ms: args.probe_delay_ms,
-    });
-
-    let results: Vec<Row> = stream::iter(domains.into_iter())
-        .map(|d| {
-            let clients = clients.clone();
-            async move { scan_domain(&clients, &d).await }
-        })
-        .buffer_unordered(args.concurrency)
-        .collect()
-        .await;
-
-    let mut wtr = csv::Writer::from_path(&args.output)?;
-    for row in &results {
-        wtr.serialize(row)?;
-        println!(
-            "{:<35} wp={:<5} [{}]  plugin={:<28} ver={:<10} vuln={}",
-            row.domain, row.is_wordpress, row.wp_detection, row.plugin_status, row.plugin_version, row.cve_2026_9858_vulnerable
-        );
-    }
-    wtr.flush()?;
-
-    let total = results.len();
-    let wp_count = results.iter().filter(|r| r.is_wordpress).count();
-    let vulnerable = results.iter().filter(|r| r.cve_2026_9858_vulnerable).count();
-    let suspected = results.iter().filter(|r| r.plugin_status == "suspected_from_html_no_version").count();
-    let unreachable = results.iter().filter(|r| r.plugin_status == "skipped_unreachable").count();
-
-    println!(
-        "\nИтого: {} доменов. WordPress найден на {}. Уязвимо к CVE-2026-9858: {}. На ручную проверку (плагин виден, версия нет): {}. Недоступно/сетевая ошибка: {} (их надо перепроверить отдельно, это НЕ 'не WP').\nПолный отчёт: {}",
-        total, wp_count, vulnerable, suspected, unreachable, args.output
+    eprintln!(
+        "\nDone: {} hosts, {} VULNERABLE. Review VERIFY_BACKPORT and UNKNOWN_VERSION manually.",
+        results.len(),
+        vuln
     );
-
-    Ok(())
 }
